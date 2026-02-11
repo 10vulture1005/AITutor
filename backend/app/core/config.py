@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
-    SECRET_KEY: str = "unsafe-secret-key-change-me"  # For session middleware
+    SECRET_KEY: str = "some shit idk"  # For session middleware
     
     # Models
     OPENAI_API_KEY: Optional[str] = None
