@@ -21,3 +21,4 @@ pypdf>=3.17.0
 python-dotenv>=1.0.0
 openai-whisper>=20231117
 moviepy>=1.0.3
+itsdangerous>=2.2.0
