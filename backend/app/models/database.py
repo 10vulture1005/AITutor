@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import Column, String, DateTime, Boolean, BigInteger, Integer, Text, ForeignKey, Index
+from sqlalchemy import Column, String, DateTime, Boolean, BigInteger, Integer, Text, ForeignKey, Index, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 

@@ -31,8 +31,15 @@ class Settings(BaseSettings):
     
     EMBEDDING_MODEL: str = "BAAI/bge-base-en-v1.5"
 
+    # ── Model settings (different models to distribute TPM load) ──
+    # Agent: best tool calling + structured output support
+    AGENT_MODEL: str = "openai/gpt-oss-120b"
+    # JSON tasks (flashcards, etc.): lightweight + great JSON output
+    JSON_MODEL: str = "openai/gpt-oss-20b"
+    # Web search: Groq's built-in web search
+    WEB_SEARCH_MODEL: str = "groq/compound-mini"
+
     # RAG settings
-    RAG_LLM_MODEL: str = "llama-3.3-70b-versatile"
     RAG_LLM_TEMPERATURE: float = 0.3
     RAG_RETRIEVER_K: int = 5
     RAG_RETRIEVER_FETCH_K: int = 30

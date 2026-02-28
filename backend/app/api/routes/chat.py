@@ -1,29 +1,29 @@
 """
-Chat API endpoints for Eduverse RAG.
+Chat API endpoints for Eduverse AI tutor.
 
-Provides three endpoints:
-  POST   /chat/query              → Ask a question, get answer + citations
+Provides five endpoints:
+  POST   /chat/query              → Ask a question, get smart answer
+  POST   /chat/query/stream       → Ask a question, get streamed SSE response
+  GET    /chat/sessions            → List user's chat sessions
   GET    /chat/history/{session}  → Retrieve conversation history
   DELETE /chat/session/{session}  → Clear a session's memory
 """
 
-import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
 from app.core.database import get_db
 from app.models.database import User
-from app.rag.chains import build_rag_chain
-from app.rag.citations import extract_citations
-from app.rag.memory import clear_session, get_session_messages
-from app.rag.vector_store import EduverseVectorStore
+from app.rag.agent import build_tutor_agent, invoke_agent, stream_agent
+from app.rag.tools import get_citations
+from app.rag.memory import clear_session, get_session_messages, list_user_sessions
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -88,11 +88,14 @@ async def chat_query(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Send a question and receive a citation-grounded answer.
+    Send a question and receive an intelligent answer.
 
-    The RAG pipeline retrieves relevant chunks from the user's
-    indexed materials, then generates an answer with [1], [2], etc.
-    citations mapped to source documents.
+    The AI tutor agent decides how to handle the query:
+    - General questions → answered directly
+    - Course questions → searches materials with citations
+    - Unknown topics → searches the web via Groq
+    - Flashcard requests → generates study flashcards
+    - Summary requests → summarizes course topics
 
     **Headers required**:
       - `Authorization: Bearer <jwt>`
@@ -100,10 +103,9 @@ async def chat_query(
 
     **Optional fields**:
       - `session_id`: Reuse a session for follow-up questions.
-        Auto-generated if omitted.
       - `course_id`: Restrict retrieval to one course's materials.
     """
-    # ── Validate API key format ───────────────────────────────────
+    # ── Validate inputs ──────────────────────────────────────────
     if not x_groq_api_key or not x_groq_api_key.startswith("gsk_"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -119,55 +121,49 @@ async def chat_query(
     # ── Session management ────────────────────────────────────────
     session_id = request.session_id or f"{user.id}_{uuid.uuid4().hex[:12]}"
 
-    # ── Pre-check: does user have any indexed documents? ──────────
-    vs = EduverseVectorStore(user_id=user.id)
-    info = vs.collection_info()
-    if info["count"] == 0:
-        return QueryResponse(
-            answer="You haven't indexed any documents yet. "
-                   "Please upload and index files first using the "
-                   "/indexing/file/{file_id} endpoint.",
-            citations=[],
-            session_id=session_id,
-            sources_used=0,
-        )
-
     try:
-        # ── Build and invoke chain ────────────────────────────────
-        chain = build_rag_chain(
+        # ── Build and invoke the tutor agent ──────────────────────
+        agent = build_tutor_agent(
             user_id=user.id,
             groq_api_key=x_groq_api_key,
             course_id=request.course_id,
         )
 
-        # Run chain synchronously in a thread — required because
-        # RunnableWithMessageHistory calls get_session_history() sync,
-        # and PostgresChatMessageHistory uses a sync psycopg.Connection.
-        # asyncio.to_thread keeps the event loop free during execution.
-        result = await asyncio.to_thread(
-            chain.invoke,
-            {"input": request.question},
-            config={"configurable": {"session_id": session_id}},
+        result = await invoke_agent(
+            agent=agent,
+            query=request.question,
+            session_id=session_id,
         )
 
         answer = result.get("answer", "I could not generate a response.")
-        context_docs = result.get("context", [])
 
-        # ── Extract citations ─────────────────────────────────────
-        citations = extract_citations(answer, context_docs)
+        # ── Get citations from tool cache (structured JSON) ──
+        sources = get_citations(user.id)
+        citations = [
+            CitationResponse(
+                number=s["id"],
+                source_id=None,
+                file_name=s["file_name"],
+                source_type=s.get("source_type", "document"),
+                page_number=s.get("page_number"),
+                start_time=s.get("start_time"),
+                end_time=s.get("end_time"),
+                text_snippet=s.get("content", "")[:200],
+            )
+            for s in sources
+        ]
 
         logger.info(
             f"Chat query completed: user={user.id}, "
             f"session={session_id}, "
-            f"sources={len(context_docs)}, "
             f"citations={len(citations)}"
         )
 
         return QueryResponse(
             answer=answer,
-            citations=[CitationResponse(**c) for c in citations],
+            citations=citations,
             session_id=session_id,
-            sources_used=len(context_docs),
+            sources_used=len(sources),
         )
 
     except HTTPException:
@@ -178,6 +174,59 @@ async def chat_query(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Query failed: {str(e)}",
         )
+
+
+@router.post("/query/stream")
+async def chat_query_stream(
+    request: QueryRequest,
+    x_groq_api_key: str = Header(..., alias="X-Groq-Api-Key"),
+    user: User = Depends(get_current_user),
+):
+    """
+    Stream the tutor's response via Server-Sent Events (SSE).
+
+    Each event is a JSON object with `type` and `content`:
+    - `{"type": "tool_call", "tool": "search_web", "args": "..."}`
+    - `{"type": "tool_result", "tool": "search_web", "content": "..."}`
+    - `{"type": "answer", "content": "The answer is..."}`
+    - `data: [DONE]` when complete
+
+    Use this for a real-time, responsive chat experience.
+    """
+    if not x_groq_api_key or not x_groq_api_key.startswith("gsk_"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Groq API key.",
+        )
+
+    session_id = request.session_id or f"{user.id}_{uuid.uuid4().hex[:12]}"
+
+    agent = build_tutor_agent(
+        user_id=user.id,
+        groq_api_key=x_groq_api_key,
+        course_id=request.course_id,
+    )
+
+    return StreamingResponse(
+        stream_agent(agent, request.question, session_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Session-Id": session_id,
+        },
+    )
+
+
+
+
+# ─── Session & History Endpoints ──────────────────────────────────────
+
+@router.get("/sessions")
+async def list_sessions(user: User = Depends(get_current_user)):
+    """List all chat sessions for the current user."""
+    sessions = list_user_sessions(user.id)
+    return {"sessions": sessions, "count": len(sessions)}
 
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
@@ -191,7 +240,6 @@ async def chat_history(
     Returns all human/AI message pairs stored in memory
     for the given session.
     """
-    # Security: ensure session belongs to user
     if not session_id.startswith(user.id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -217,7 +265,6 @@ async def delete_session(
 
     Frees memory and resets the chat context for the session.
     """
-    # Security: ensure session belongs to user
     if not session_id.startswith(user.id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -236,3 +283,4 @@ async def delete_session(
         "message": f"Session '{session_id}' cleared.",
         "session_id": session_id,
     }
+

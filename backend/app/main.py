@@ -54,3 +54,12 @@ app = create_application()
 def root():
     return {"message": "Welcome to Eduverse Backend"}
 
+
+@app.get("/health")
+def health_check():
+    """Health check for monitoring and deployment verification."""
+    return {
+        "status": "healthy",
+        "version": "1.1.0",
+        "service": "eduverse-ai-tutor",
+    }

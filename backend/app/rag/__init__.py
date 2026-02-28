@@ -1,1 +1,1 @@
-# RAG components module (vector store, retriever, chains)
+# RAG components: agent, tools, retriever, vector store, memory
