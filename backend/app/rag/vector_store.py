@@ -53,6 +53,9 @@ class EduverseVectorStore:
 
     Each user gets their own collection (namespace) within the same
     pgvector table, enabling efficient multi-tenant vector search.
+
+    Uses the shared sync engine pool to avoid creating a new
+    SQLAlchemy engine per instantiation.
     """
 
     def __init__(self, user_id: str):
@@ -62,7 +65,7 @@ class EduverseVectorStore:
         self._store = PGVector(
             collection_name=self.collection_name,
             embeddings=self.embeddings,
-            connection=settings.PG_SYNC_URL,
+            connection=get_sync_engine(),  # shared pool, no per-request engine
             use_jsonb=True,
         )
 

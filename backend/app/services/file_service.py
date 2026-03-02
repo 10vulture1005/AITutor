@@ -12,6 +12,7 @@ from google.oauth2.credentials import Credentials
 
 from app.core.config import settings
 from app.core.exceptions import DriveAPIError, ProcessingError
+from app.core.utils import detect_file_type
 
 
 class FileService:
@@ -110,38 +111,13 @@ class FileService:
     
     def _calculate_hash(self, file_path: Path) -> str:
         """Calculate SHA-256 hash of a file."""
-        sha256_hash = hashlib.sha256()
         with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
+            return hashlib.file_digest(f, "sha256").hexdigest()
     
-    def detect_file_type(self, mime_type: str, file_name: str) -> str:
-        """
-        Detect normalized file type from MIME type and filename.
-        
-        Returns:
-            "pdf", "video", "audio", "image", "text", or "unknown"
-        """
-        mime_lower = mime_type.lower() if mime_type else ""
-        name_lower = file_name.lower()
-        
-        if "pdf" in mime_lower or name_lower.endswith(".pdf"):
-            return "pdf"
-        
-        if "video" in mime_lower or any(name_lower.endswith(ext) for ext in [".mp4", ".avi", ".mov", ".mkv", ".webm"]):
-            return "video"
-        
-        if "audio" in mime_lower or any(name_lower.endswith(ext) for ext in [".mp3", ".wav", ".m4a", ".ogg", ".aac"]):
-            return "audio"
-        
-        if "image" in mime_lower or any(name_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-            return "image"
-        
-        if any(keyword in mime_lower for keyword in ["text", "document", "msword", "wordprocessing"]):
-            return "text"
-        
-        return "unknown"
+    @staticmethod
+    def detect_file_type(mime_type: str, file_name: str) -> str:
+        """Detect normalized file type. Delegates to shared utility."""
+        return detect_file_type(mime_type, file_name)
     
     def delete_file(self, local_path: str) -> bool:
         """

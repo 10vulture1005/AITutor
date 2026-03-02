@@ -2,8 +2,8 @@
 Agent tools for the Eduverse AI tutor.
 
 Four tools that the LangGraph ReAct agent can call:
-1. search_course_materials — RAG retrieval (stores structured citations in cache)
-2. search_web             — Groq compound-mini web search
+1. search_course_materials — RAG retrieval with relevance filtering
+2. search_web             — Groq compound-mini web search (user-consented only)
 3. generate_flashcards    — study flashcard generation
 4. summarize_topic        — structured topic summaries
 """
@@ -16,6 +16,7 @@ from groq import Groq
 from langchain_core.tools import tool
 
 from app.core.config import settings
+from app.core.utils import detect_source_type
 from app.rag.retriever import build_retriever
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ def get_citations(user_id: str) -> list:
     return _citation_cache.pop(user_id, [])
 
 
-# ── Tool 1: Search course materials ──────────────────────────────
+# ── Tool 1: Search course materials (with relevance filtering) ───
 
 def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Optional[str] = None):
     """Factory: returns a tool bound to the user's vector store."""
@@ -39,8 +40,10 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
     @tool
     def search_course_materials(query: str) -> str:
         """Search the student's indexed course materials (PDFs, videos, audio, images).
-        Returns numbered source blocks with citations. Use this when the student
-        asks about their specific course content, lectures, or assignments."""
+        Returns numbered source blocks with citations and relevance scores.
+        Use this when the student asks about their specific course content,
+        lectures, or assignments. Results below the relevance threshold are
+        automatically filtered out."""
         try:
             retriever = build_retriever(user_id, groq_api_key, course_id)
             docs = retriever.invoke(query)
@@ -48,17 +51,45 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
                 _citation_cache[user_id] = []
                 return "No relevant information found in course materials."
 
+            # ── Filter by relevance score ─────────────────────────
+            # FlashRank reranker adds 'relevance_score' to metadata.
+            # Filter out documents below the threshold to prevent
+            # citing irrelevant content.
+            threshold = settings.RAG_RELEVANCE_THRESHOLD
+            relevant_docs = [
+                doc for doc in docs
+                if doc.metadata.get("relevance_score", 0.0) >= threshold
+            ]
+
+            if not relevant_docs:
+                _citation_cache[user_id] = []
+                logger.info(
+                    f"All {len(docs)} results below relevance threshold "
+                    f"({threshold}) for query: {query[:80]}"
+                )
+                return (
+                    "No relevant information found in course materials. "
+                    "The search returned some results but none were relevant "
+                    "enough to the query."
+                )
+
+            logger.info(
+                f"Relevance filter: {len(docs)} → {len(relevant_docs)} docs "
+                f"(threshold={threshold})"
+            )
+
             # Build formatted text for the LLM
             # Use parent_content (richer context) if available, else chunk content
             blocks = []
-            for i, doc in enumerate(docs, 1):
+            for i, doc in enumerate(relevant_docs, 1):
                 meta = doc.metadata
                 source = meta.get("file_name", "unknown")
                 page = meta.get("page_number")
+                score = meta.get("relevance_score", 0.0)
                 header = f"[{i}] (source: {source}"
                 if page is not None:
                     header += f", page {page}"
-                header += ")"
+                header += f", relevance: {score:.2f})"
                 # Parent content gives 800-char context vs 300-char child chunk
                 content = meta.get("parent_content", doc.page_content)
                 blocks.append(f"{header}\n{content}")
@@ -68,14 +99,14 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
                 {
                     "id": i,
                     "file_name": doc.metadata.get("file_name", "unknown"),
-                    "source_type": _detect_type(doc.metadata.get("file_name", "")),
+                    "source_type": detect_source_type(doc.metadata.get("file_name", "")),
                     "page_number": doc.metadata.get("page_number"),
                     "start_time": doc.metadata.get("start_time"),
                     "end_time": doc.metadata.get("end_time"),
                     "relevance_score": round(doc.metadata.get("relevance_score", 0.0), 3),
                     "content": doc.page_content[:200],
                 }
-                for i, doc in enumerate(docs, 1)
+                for i, doc in enumerate(relevant_docs, 1)
             ]
 
             return "\n\n".join(blocks)
@@ -86,18 +117,6 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
     return search_course_materials
 
 
-def _detect_type(file_name: str) -> str:
-    """Detect source type from file name."""
-    name = file_name.lower()
-    if name.endswith(".pdf"):
-        return "pdf"
-    elif any(name.endswith(e) for e in (".mp4", ".avi", ".mkv")):
-        return "video"
-    elif any(name.endswith(e) for e in (".mp3", ".wav", ".m4a")):
-        return "audio"
-    return "document"
-
-
 # ── Tool 2: Web search via Groq compound-mini ────────────────────
 
 def _make_search_web(groq_api_key: str):
@@ -105,10 +124,10 @@ def _make_search_web(groq_api_key: str):
 
     @tool
     def search_web(query: str) -> str:
-        """Search the internet for information not found in course materials.
-        Returns web search results with source URLs. Use this when the student
-        asks about topics not covered in their indexed materials, or for
-        current events and general knowledge questions."""
+        """Search the internet for information. ONLY use this tool when the
+        student has EXPLICITLY asked to search the web (e.g., 'search online',
+        'yes look it up', 'search the web for it'). NEVER call this tool
+        automatically — always ask the student first."""
         try:
             client = Groq(api_key=groq_api_key)
             response = client.chat.completions.create(
@@ -125,8 +144,6 @@ def _make_search_web(groq_api_key: str):
             return f"Web search failed: {e}"
 
     return search_web
-
-
 
 
 # ── Tool 3: Flashcard generation ─────────────────────────────────
@@ -163,7 +180,16 @@ def _make_generate_flashcards(user_id: str, groq_api_key: str, course_id: Option
             if not docs:
                 return "No course materials found on this topic."
 
-            context = "\n\n".join(doc.page_content for doc in docs)
+            # Filter by relevance for flashcards too
+            threshold = settings.RAG_RELEVANCE_THRESHOLD
+            relevant_docs = [
+                doc for doc in docs
+                if doc.metadata.get("relevance_score", 0.0) >= threshold
+            ]
+            if not relevant_docs:
+                return "No sufficiently relevant course materials found for this topic."
+
+            context = "\n\n".join(doc.page_content for doc in relevant_docs)
 
             client = Groq(api_key=groq_api_key)
             response = client.chat.completions.create(
@@ -229,7 +255,16 @@ def _make_summarize_topic(user_id: str, groq_api_key: str, course_id: Optional[s
             if not docs:
                 return "No course materials found on this topic."
 
-            context = "\n\n".join(doc.page_content for doc in docs)
+            # Filter by relevance for summaries too
+            threshold = settings.RAG_RELEVANCE_THRESHOLD
+            relevant_docs = [
+                doc for doc in docs
+                if doc.metadata.get("relevance_score", 0.0) >= threshold
+            ]
+            if not relevant_docs:
+                return "No sufficiently relevant course materials found for this topic."
+
+            context = "\n\n".join(doc.page_content for doc in relevant_docs)
 
             client = Groq(api_key=groq_api_key)
             response = client.chat.completions.create(
@@ -243,7 +278,7 @@ def _make_summarize_topic(user_id: str, groq_api_key: str, course_id: Optional[s
 
             summary = response.choices[0].message.content
             source_names = set(
-                d.metadata.get("file_name", "unknown") for d in docs
+                d.metadata.get("file_name", "unknown") for d in relevant_docs
             )
             summary += f"\n\n📚 _Sources: {', '.join(source_names)}_"
             return summary

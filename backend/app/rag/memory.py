@@ -109,8 +109,9 @@ def get_session_messages(session_id: str) -> List[dict]:
                 messages.append({"role": "human", "content": content})
             elif msg_type == "ai" and content:
                 # Skip tool-call-only messages (no user-facing content)
-                if not getattr(msg, "tool_calls", None) or content:
-                    messages.append({"role": "ai", "content": content})
+                if getattr(msg, "tool_calls", None) and not content.strip():
+                    continue
+                messages.append({"role": "ai", "content": content})
 
         return messages
     except Exception as e:

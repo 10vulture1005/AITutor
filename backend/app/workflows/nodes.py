@@ -22,6 +22,7 @@ from typing import Any, Dict
 from sqlalchemy import select, update
 
 from app.core.config import settings
+from app.core.utils import detect_file_type
 from app.core.database import AsyncSessionLocal
 from app.core.security import decrypt_token
 from app.models.database import File, User
@@ -153,7 +154,7 @@ async def process_node(state: IndexingState) -> Dict[str, Any]:
     logger.info(f"[process] Processing '{file_name}' (mime={mime_type})")
 
     # Detect file type using the same logic as FileService
-    file_type = _detect_type(mime_type, file_name)
+    file_type = detect_file_type(mime_type, file_name)
 
     try:
         if file_type == "pdf":
@@ -245,7 +246,7 @@ async def chunk_node(state: IndexingState) -> Dict[str, Any]:
     course_id = state.get("course_id")
     course_name = state.get("course_name")
 
-    merger = SemanticMerger(chunk_size=500, chunk_overlap=100)
+    merger = SemanticMerger()  # uses default 300/50 (optimized for precision)
     chunks = merger.merge_and_chunk(
         documents=documents,
         course_id=course_id,
@@ -297,9 +298,11 @@ async def update_db_node(state: IndexingState) -> Dict[str, Any]:
     Update the File record in the database with processing results.
 
     Sets processing_status, chunk_count, contains_visual, detected_type,
-    and processed_at timestamp.
+    and processed_at timestamp. Also invalidates the retriever cache
+    so the next query picks up the newly indexed documents.
     """
     file_id = state["file_id"]
+    user_id = state["user_id"]
     chunk_count = state.get("chunk_count", 0)
     contains_visual = state.get("contains_visual", False)
     file_type = state.get("file_type")
@@ -318,6 +321,10 @@ async def update_db_node(state: IndexingState) -> Dict[str, Any]:
             )
         )
         await db.commit()
+
+    # Invalidate retriever cache so next query uses fresh data
+    from app.rag.retriever import invalidate_retriever_cache
+    invalidate_retriever_cache(user_id)
 
     logger.info(
         f"[update_db] File {file_id}: status=completed, "
@@ -364,24 +371,4 @@ def should_continue(state: IndexingState) -> str:
     return "continue"
 
 
-# ── Utility ──────────────────────────────────────────────────────
-def _detect_type(mime_type: str, file_name: str) -> str:
-    """Detect normalized file type from MIME type and filename."""
-    mime_lower = (mime_type or "").lower()
-    name_lower = file_name.lower()
-
-    if "pdf" in mime_lower or name_lower.endswith(".pdf"):
-        return "pdf"
-    if "video" in mime_lower or any(
-        name_lower.endswith(ext) for ext in [".mp4", ".avi", ".mov", ".mkv", ".webm"]
-    ):
-        return "video"
-    if "audio" in mime_lower or any(
-        name_lower.endswith(ext) for ext in [".mp3", ".wav", ".m4a", ".ogg", ".aac"]
-    ):
-        return "audio"
-    if "image" in mime_lower or any(
-        name_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
-    ):
-        return "image"
-    return "unknown"
+# _detect_type moved to app.core.utils.detect_file_type

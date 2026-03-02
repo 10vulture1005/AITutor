@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     RAG_RETRIEVER_K: int = 5
     RAG_RETRIEVER_FETCH_K: int = 30
     RAG_RERANK_TOP_N: int = 5
+    RAG_RELEVANCE_THRESHOLD: float = 0.45  
 
     GROQ_API_KEY: Optional[str] = None
 
