@@ -1,16 +1,5 @@
 import re
 
-class TextCleaner:
-    """Text cleaning utilities for all extracted content."""
-    
-    def clean(self, text: str) -> str:
-        """Full cleaning pipeline for extracted text."""
-        return clean_text(text)
-    
-    def clean_transcription(self, text: str) -> str:
-        """Clean audio transcription: remove fillers and annotations."""
-        return clean_transcription(text)
-
 def clean_text(text: str) -> str:
     """Full cleaning pipeline for extracted text."""
     if not text:

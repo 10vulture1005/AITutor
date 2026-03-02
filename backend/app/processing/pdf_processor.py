@@ -88,32 +88,3 @@ async def process_pdf(
         raise RuntimeError(f"PDF processing failed: {e}") from e
     finally:
         os.unlink(tmp_path)
-
-
-async def process_pdf_file(
-    file_path: str,
-    groq_api_key: str,
-    file_name: Optional[str] = None,
-    course_id: Optional[str] = None,
-    source_id: Optional[str] = None,
-) -> List[Document]:
-    """Process PDF from file path (no temp file needed)."""
-    if file_name is None:
-        file_name = os.path.basename(file_path)
-
-    try:
-        loader = _build_loader(file_path, groq_api_key)
-        docs = await asyncio.to_thread(loader.load)
-
-        enriched = [
-            _enrich_metadata(doc, file_name, course_id, source_id)
-            for doc in docs
-            if doc.page_content.strip()
-        ]
-
-        logger.info(f"Processed PDF '{file_name}': {len(enriched)} pages")
-        return enriched
-
-    except Exception as e:
-        logger.error(f"PDF processing failed for '{file_name}': {e}")
-        return []

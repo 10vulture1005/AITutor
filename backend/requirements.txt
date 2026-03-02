@@ -58,4 +58,3 @@ backoff>=2.2.0
 
 # Utils
 python-dotenv>=1.0.0
-moviepy>=1.0.3
