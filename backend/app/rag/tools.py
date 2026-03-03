@@ -12,74 +12,85 @@ import json
 import logging
 from typing import Optional
 
-from groq import Groq
 from langchain_core.tools import tool
 
 from app.core.config import settings
-from app.core.utils import detect_source_type
+from app.core.utils import create_groq_client, detect_source_type
 from app.rag.retriever import build_retriever
 
 logger = logging.getLogger(__name__)
 
 # ── Citation cache ────────────────────────────────────────────────
 # Stores structured citations from the last search_course_materials call
-# per user. Read by chat.py after agent completes.
-_citation_cache: dict[str, list] = {}
+# per session. Read by chat.py after agent completes.
+# Entries are auto-evicted after _CITATION_TTL seconds to prevent leaks
+# (e.g. the streaming endpoint never calls get_citations).
+import time as _time
+
+_citation_cache: dict[str, tuple[list, float]] = {}  # session_id → (citations, timestamp)
+_CITATION_TTL = 300  # 5 minutes
 
 
-def get_citations(user_id: str) -> list:
-    """Get and clear cached citations for a user (called by chat.py)."""
-    return _citation_cache.pop(user_id, [])
+def _evict_stale_citations() -> None:
+    """Remove citation entries older than _CITATION_TTL."""
+    now = _time.time()
+    stale = [k for k, (_, ts) in _citation_cache.items() if now - ts > _CITATION_TTL]
+    for k in stale:
+        del _citation_cache[k]
+
+
+def get_citations(session_id: str) -> list:
+    """Get and clear cached citations for a session (called by chat.py)."""
+    _evict_stale_citations()
+    entry = _citation_cache.pop(session_id, None)
+    return entry[0] if entry else []
 
 
 # ── Tool 1: Search course materials (with relevance filtering) ───
 
-def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Optional[str] = None):
+def _make_search_course_materials(
+    user_id: str, groq_api_key: str, course_id: Optional[str] = None, session_id: Optional[str] = None,
+):
     """Factory: returns a tool bound to the user's vector store."""
+    cache_key = session_id or user_id
 
     @tool
     def search_course_materials(query: str) -> str:
         """Search the student's indexed course materials (PDFs, videos, audio, images).
         Returns numbered source blocks with citations and relevance scores.
-        Use this when the student asks about their specific course content,
-        lectures, or assignments. Results below the relevance threshold are
-        automatically filtered out."""
+        Use this for ANY question related to the student's course — including
+        specific topics, course overview, or what the course covers."""
         try:
             retriever = build_retriever(user_id, groq_api_key, course_id)
-            docs = retriever.invoke(query)
-            if not docs:
-                _citation_cache[user_id] = []
-                return "No relevant information found in course materials."
 
-            # ── Filter by relevance score ─────────────────────────
-            # FlashRank reranker adds 'relevance_score' to metadata.
-            # Filter out documents below the threshold to prevent
-            # citing irrelevant content.
-            threshold = settings.RAG_RELEVANCE_THRESHOLD
-            relevant_docs = [
-                doc for doc in docs
-                if doc.metadata.get("relevance_score", 0.0) >= threshold
-            ]
+            # Get course file inventory (fast SQL DISTINCT query)
+            from app.rag.vector_store import EduverseVectorStore
+            vs = EduverseVectorStore(user_id=user_id)
+            indexed_files = vs.list_indexed_files(course_id)
+
+            relevant_docs = retriever.invoke(query)
+
+            # Always include file inventory so the agent knows what's available
+            file_header = ""
+            if indexed_files:
+                shown = indexed_files[:15]
+                suffix = f" (+{len(indexed_files) - 15} more)" if len(indexed_files) > 15 else ""
+                file_header = (
+                    f"[COURSE INVENTORY: {len(indexed_files)} indexed files: "
+                    f"{', '.join(shown)}{suffix}]\n\n"
+                )
 
             if not relevant_docs:
-                _citation_cache[user_id] = []
-                logger.info(
-                    f"All {len(docs)} results below relevance threshold "
-                    f"({threshold}) for query: {query[:80]}"
-                )
+                _citation_cache[cache_key] = ([], _time.time())
                 return (
-                    "No relevant information found in course materials. "
-                    "The search returned some results but none were relevant "
-                    "enough to the query."
+                    file_header +
+                    "No specific content chunks matched this query. "
+                    "The file names above show what materials are available."
                 )
-
-            logger.info(
-                f"Relevance filter: {len(docs)} → {len(relevant_docs)} docs "
-                f"(threshold={threshold})"
-            )
 
             # Build formatted text for the LLM
-            # Use parent_content (richer context) if available, else chunk content
+            # Use expanded content (3-chunk window from retriever)
+            # or parent_content (richer page context) if available
             blocks = []
             for i, doc in enumerate(relevant_docs, 1):
                 meta = doc.metadata
@@ -90,12 +101,15 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
                 if page is not None:
                     header += f", page {page}"
                 header += f", relevance: {score:.2f})"
-                # Parent content gives 800-char context vs 300-char child chunk
-                content = meta.get("parent_content", doc.page_content)
-                blocks.append(f"{header}\n{content}")
+                # Retriever already expanded with neighbour context,
+                # so page_content is the richest available text.
+                # Fall back to parent_content for pre-expansion chunks.
+                # Truncate to 300 chars to stay within model TPM limits.
+                content = doc.page_content or meta.get("parent_content", "")
+                blocks.append(f"{header}\n{content[:300]}")
 
             # Store structured citations in cache (read by chat.py)
-            _citation_cache[user_id] = [
+            _citation_cache[cache_key] = ([
                 {
                     "id": i,
                     "file_name": doc.metadata.get("file_name", "unknown"),
@@ -107,9 +121,9 @@ def _make_search_course_materials(user_id: str, groq_api_key: str, course_id: Op
                     "content": doc.page_content[:200],
                 }
                 for i, doc in enumerate(relevant_docs, 1)
-            ]
+            ], _time.time())
 
-            return "\n\n".join(blocks)
+            return file_header + "\n\n".join(blocks)
         except Exception as e:
             logger.error(f"Course search failed: {e}")
             return f"Course material search failed: {e}"
@@ -129,7 +143,7 @@ def _make_search_web(groq_api_key: str):
         'yes look it up', 'search the web for it'). NEVER call this tool
         automatically — always ask the student first."""
         try:
-            client = Groq(api_key=groq_api_key)
+            client = create_groq_client(groq_api_key)
             response = client.chat.completions.create(
                 model=settings.WEB_SEARCH_MODEL,
                 messages=[{"role": "user", "content": query}],
@@ -176,22 +190,13 @@ def _make_generate_flashcards(user_id: str, groq_api_key: str, course_id: Option
             num_cards: Number of flashcards (default 10)"""
         try:
             retriever = build_retriever(user_id, groq_api_key, course_id)
-            docs = retriever.invoke(topic)
-            if not docs:
-                return "No course materials found on this topic."
-
-            # Filter by relevance for flashcards too
-            threshold = settings.RAG_RELEVANCE_THRESHOLD
-            relevant_docs = [
-                doc for doc in docs
-                if doc.metadata.get("relevance_score", 0.0) >= threshold
-            ]
+            relevant_docs = retriever.invoke(topic)
             if not relevant_docs:
                 return "No sufficiently relevant course materials found for this topic."
 
             context = "\n\n".join(doc.page_content for doc in relevant_docs)
 
-            client = Groq(api_key=groq_api_key)
+            client = create_groq_client(groq_api_key)
             response = client.chat.completions.create(
                 model=settings.JSON_MODEL,
                 messages=[{
@@ -251,24 +256,15 @@ def _make_summarize_topic(user_id: str, groq_api_key: str, course_id: Optional[s
             topic: The subject or chapter to summarize"""
         try:
             retriever = build_retriever(user_id, groq_api_key, course_id)
-            docs = retriever.invoke(topic)
-            if not docs:
-                return "No course materials found on this topic."
-
-            # Filter by relevance for summaries too
-            threshold = settings.RAG_RELEVANCE_THRESHOLD
-            relevant_docs = [
-                doc for doc in docs
-                if doc.metadata.get("relevance_score", 0.0) >= threshold
-            ]
+            relevant_docs = retriever.invoke(topic)
             if not relevant_docs:
                 return "No sufficiently relevant course materials found for this topic."
 
             context = "\n\n".join(doc.page_content for doc in relevant_docs)
 
-            client = Groq(api_key=groq_api_key)
+            client = create_groq_client(groq_api_key)
             response = client.chat.completions.create(
-                model=settings.AGENT_MODEL,
+                model=settings.SUMMARY_MODEL,
                 messages=[{
                     "role": "user",
                     "content": SUMMARY_PROMPT.format(topic=topic, context=context),
@@ -296,10 +292,11 @@ def build_agent_tools(
     user_id: str,
     groq_api_key: str,
     course_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> list:
     """Build the complete tool set (4 tools) for the tutor agent."""
     return [
-        _make_search_course_materials(user_id, groq_api_key, course_id),
+        _make_search_course_materials(user_id, groq_api_key, course_id, session_id),
         _make_search_web(groq_api_key),
         _make_generate_flashcards(user_id, groq_api_key, course_id),
         _make_summarize_topic(user_id, groq_api_key, course_id),

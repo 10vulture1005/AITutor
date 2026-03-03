@@ -62,11 +62,17 @@ class GoogleAuthService:
             access_type='offline',
             prompt='consent'
         )
-        return authorization_url, state
+        # PKCE: flow generates a code_verifier that must be reused during token exchange
+        code_verifier = flow.code_verifier
+        return authorization_url, state, code_verifier
 
-    async def exchange_code_for_tokens(self, code: str) -> dict:
+    async def exchange_code_for_tokens(self, code: str, code_verifier: str = None) -> dict:
         """
         Exchange authorization code for tokens.
+        
+        Args:
+            code: Authorization code from Google callback
+            code_verifier: PKCE code verifier from the login step
         
         Returns:
             {
@@ -85,6 +91,9 @@ class GoogleAuthService:
                 scopes=self.SCOPES,
                 redirect_uri=settings.GOOGLE_REDIRECT_URI
             )
+            # Restore the PKCE code_verifier from the login step
+            if code_verifier:
+                flow.code_verifier = code_verifier
             flow.fetch_token(code=code)
             credentials = flow.credentials
             

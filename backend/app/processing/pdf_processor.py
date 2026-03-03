@@ -1,13 +1,13 @@
 import asyncio
 import logging
-import os
-import tempfile
 from typing import List, Optional
 
-from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.document_loaders.parsers import LLMImageBlobParser
-from langchain_groq import ChatGroq
 from langchain_core.documents import Document
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+
+from app.core.config import settings
+from app.processing.image_processor import create_vision_llm
 
 logger = logging.getLogger(__name__)
 
@@ -15,21 +15,24 @@ logger = logging.getLogger(__name__)
 def _build_loader(
     file_path: str,
     groq_api_key: str,
-    vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-) -> PyMuPDFLoader:
-    """Build a PyMuPDFLoader with Groq Vision for image analysis."""
-    vision_llm = ChatGroq(
-        model=vision_model,
-        api_key=groq_api_key,
-        max_tokens=1024,
-        temperature=0.2,
-    )
+    vision_model: str = None,
+) -> PyMuPDF4LLMLoader:
+    """Build a PyMuPDF4LLMLoader with Groq Vision for image analysis.
 
-    return PyMuPDFLoader(
+    Produces true Markdown output (# headings, **bold**, |tables|,
+    multi-column reflow) which works with the markdown-aware
+    separators in SemanticMerger for structure-preserving chunking.
+    """
+    vision_llm = create_vision_llm(groq_api_key, vision_model)
+
+    return PyMuPDF4LLMLoader(
         file_path,
         mode="page",
-        images_inner_format="markdown-img",
+        extract_images=True,
         images_parser=LLMImageBlobParser(model=vision_llm),
+        # pymupdf4llm kwargs — "lines" is less strict than default
+        # "lines_strict" and handles more table styles in student PDFs
+        table_strategy="lines",
     )
 
 
@@ -52,7 +55,7 @@ def _enrich_metadata(doc: Document, file_name: str, course_id: Optional[str], so
 
 
 async def process_pdf(
-    file_content: bytes,
+    file_path: str,
     groq_api_key: str,
     file_name: str = "document.pdf",
     course_id: Optional[str] = None,
@@ -62,15 +65,14 @@ async def process_pdf(
     Process PDF using LangChain PyMuPDFLoader + ChatGroq Vision.
     Extracts text per page, analyzes images with Groq Vision automatically.
 
+    Args:
+        file_path: Path to the PDF file on disk (avoids temp-file round trip).
+
     Returns:
         List of LangChain Documents with per-page content + metadata
     """
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(file_content)
-        tmp_path = tmp.name
-
     try:
-        loader = _build_loader(tmp_path, groq_api_key)
+        loader = _build_loader(file_path, groq_api_key)
         # loader.load() is synchronous (PyMuPDF + Groq Vision) — run in thread
         docs = await asyncio.to_thread(loader.load)
 
@@ -86,5 +88,3 @@ async def process_pdf(
     except Exception as e:
         logger.error(f"PDF processing failed for '{file_name}': {e}")
         raise RuntimeError(f"PDF processing failed: {e}") from e
-    finally:
-        os.unlink(tmp_path)

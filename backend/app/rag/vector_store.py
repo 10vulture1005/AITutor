@@ -131,32 +131,100 @@ class EduverseVectorStore:
 
         return {"name": self.collection_name, "count": count}
 
-    def get_all_documents(self, limit: int = 500) -> List[Document]:
-        """
-        Load all documents from this user's collection (for BM25 indexing).
-
-        Returns Document objects with page_content and metadata.
-        Limited to `limit` docs to prevent memory issues.
-        """
+    def list_indexed_files(self, course_id: Optional[str] = None) -> List[str]:
+        """Get distinct file names indexed in this user's collection."""
         engine = get_sync_engine()
         try:
+            sql = (
+                "SELECT DISTINCT e.cmetadata->>'file_name' AS fname "
+                "FROM langchain_pg_embedding e "
+                "JOIN langchain_pg_collection c ON e.collection_id = c.uuid "
+                "WHERE c.name = :collection "
+            )
+            params: dict = {"collection": self.collection_name}
+            if course_id:
+                sql += "AND e.cmetadata->>'course_id' = :course_id "
+                params["course_id"] = course_id
+            sql += "ORDER BY fname"
+
             with engine.connect() as conn:
-                result = conn.execute(
-                    text(
-                        "SELECT e.document, e.cmetadata FROM langchain_pg_embedding e "
-                        "JOIN langchain_pg_collection c ON e.collection_id = c.uuid "
-                        "WHERE c.name = :name "
-                        "LIMIT :limit"
-                    ),
-                    {"name": self.collection_name, "limit": limit},
-                )
+                result = conn.execute(text(sql), params)
+                return [row[0] for row in result if row[0]]
+        except Exception as e:
+            logger.warning(f"Failed to list indexed files: {e}")
+            return []
+
+    def full_text_search(
+        self,
+        query: str,
+        k: int = 10,
+        course_id: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        PostgreSQL full-text search on the user's collection.
+
+        Uses ``websearch_to_tsquery`` first (handles natural language).
+        Falls back to ``plainto_tsquery`` if no results (more lenient
+        — treats every word as OR-able via stemming).
+
+        Args:
+            query: Natural language search query
+            k: Maximum number of results to return
+            course_id: Optional filter to restrict to a specific course
+        """
+        # Try websearch_to_tsquery first, fall back to plainto_tsquery
+        for tsquery_fn in ("websearch_to_tsquery", "plainto_tsquery"):
+            docs = self._run_fts(query, k, course_id, tsquery_fn)
+            if docs:
+                return docs
+        logger.info(f"PG FTS: '{query[:50]}' → 0 hits (both strategies)")
+        return []
+
+    def _run_fts(
+        self,
+        query: str,
+        k: int,
+        course_id: Optional[str],
+        tsquery_fn: str,
+    ) -> List[Document]:
+        """Execute a single FTS query using the given tsquery function."""
+        engine = get_sync_engine()
+        try:
+            sql = (
+                f"SELECT e.document, e.cmetadata, "
+                f"ts_rank(to_tsvector('english', e.document), "
+                f"        {tsquery_fn}('english', :query)) AS rank "
+                f"FROM langchain_pg_embedding e "
+                f"JOIN langchain_pg_collection c ON e.collection_id = c.uuid "
+                f"WHERE c.name = :collection "
+                f"AND to_tsvector('english', e.document) @@ {tsquery_fn}('english', :query) "
+            )
+            params: dict = {
+                "collection": self.collection_name,
+                "query": query,
+                "k": k,
+            }
+            if course_id:
+                sql += "AND e.cmetadata->>'course_id' = :course_id "
+                params["course_id"] = course_id
+
+            sql += "ORDER BY rank DESC LIMIT :k"
+
+            with engine.connect() as conn:
+                result = conn.execute(text(sql), params)
                 docs = []
                 for row in result:
+                    meta = row[1] or {}
+                    meta["fts_rank"] = float(row[2])
                     docs.append(Document(
                         page_content=row[0] or "",
-                        metadata=row[1] or {},
+                        metadata=meta,
                     ))
+                if docs:
+                    logger.info(
+                        f"PG FTS ({tsquery_fn}): '{query[:50]}' → {len(docs)} hits"
+                    )
                 return docs
         except Exception as e:
-            logger.warning(f"Could not load documents for BM25: {e}")
+            logger.warning(f"PG FTS ({tsquery_fn}) failed: {e}")
             return []

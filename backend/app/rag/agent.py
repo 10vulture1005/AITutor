@@ -1,10 +1,13 @@
 """
-LangGraph ReAct agent for the Eduverse AI tutor.
+LangGraph agent for the Eduverse AI tutor.
 
-Autonomous agent with 4 tools: search_course_materials, search_web,
-generate_flashcards, and summarize_topic.
+Uses the new ``langchain.agents.create_agent`` API (LangGraph ≥ 1.0) with
+built-in middleware for:
+  - Automatic conversation summarisation when the context grows too large
+  - Configurable model-call retries with exponential back-off
+  - A hard model-call limit as a safety net
 
-Uses PostgresSaver with connection pooling for persistent memory.
+Persistence is backed by ``PostgresSaver`` with a shared connection pool.
 """
 
 import asyncio
@@ -12,10 +15,16 @@ import json
 import logging
 from typing import AsyncGenerator, Optional
 
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelCallLimitMiddleware,
+    ModelRetryMiddleware,
+    SummarizationMiddleware,
+)
+from langchain.chat_models import init_chat_model
+from langchain.rate_limiters import InMemoryRateLimiter
 from langchain_core.messages import HumanMessage
-from langchain_groq import ChatGroq
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.prebuilt import create_react_agent
 from psycopg_pool import ConnectionPool
 
 from app.core.config import settings
@@ -23,6 +32,15 @@ from app.rag.prompts import AGENT_SYSTEM_PROMPT
 from app.rag.tools import build_agent_tools
 
 logger = logging.getLogger(__name__)
+
+# ── Rate limiter (shared across all ChatGroq instances) ───────────
+# Groq free-tier: ~30 req/min. Token-bucket smooths bursts.
+_rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.5,   # ~30 req/min
+    max_bucket_size=5,         # allow short bursts of up to 5
+    check_every_n_seconds=0.1,
+)
+
 
 # ── Connection pool (created once, reused across requests) ────────
 
@@ -85,33 +103,10 @@ def _get_checkpointer() -> PostgresSaver:
                 raise
 
 # ── History trimming ──────────────────────────────────────────────
-# Tool call messages contain large document content. Without trimming,
-# long conversations exceed the LLM's context window.
-MAX_HISTORY_MESSAGES = 10
-
-
-def _make_prompt(state: dict):
-    """
-    Callable prompt that trims history to prevent token overflow.
-
-    Keeps the system prompt + last MAX_HISTORY_MESSAGES messages.
-    Old tool call/result pairs (containing large document content)
-    are trimmed first, keeping recent conversation context.
-    """
-    from langchain_core.messages import SystemMessage, trim_messages
-
-    messages = state.get("messages", [])
-
-    trimmed = trim_messages(
-        messages,
-        max_tokens=MAX_HISTORY_MESSAGES,
-        token_counter=len,      # count by message count (simple + fast)
-        strategy="last",        # keep most recent
-        start_on="human",       # always start from a human message
-        include_system=True,    # preserve system prompt if present
-    )
-
-    return [SystemMessage(content=AGENT_SYSTEM_PROMPT)] + trimmed
+# SummarizationMiddleware auto-summarises old messages when the
+# conversation grows past `keep` messages. This replaces the old
+# manual trim_messages hack.
+MAX_HISTORY_MESSAGES = 3          # aggressive — 8K TPM budget is tight
 
 
 # ── Agent builder ─────────────────────────────────────────────────
@@ -120,27 +115,55 @@ def build_tutor_agent(
     user_id: str,
     groq_api_key: str,
     course_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ):
     """
-    Build the LangGraph ReAct tutor agent.
+    Build the LangGraph tutor agent using ``create_agent``.
 
-    Features:
-      - History trimming: keeps last 10 messages to prevent token overflow
-      - PostgreSQL persistence: sessions survive server restarts
-      - Connection pooling: prevents connection exhaustion
+    Middleware stack (applied automatically on every model call):
+      1. **SummarizationMiddleware** — condenses history once it exceeds
+         ``MAX_HISTORY_MESSAGES``, preventing token overflow.
+      2. **ModelRetryMiddleware** — retries on Groq ``tool_use_failed`` /
+         transient errors with exponential back-off.
+      3. **ModelCallLimitMiddleware** — hard cap of 25 model calls per
+         invocation to prevent infinite tool-calling loops.
     """
-    llm = ChatGroq(
-        model=settings.AGENT_MODEL,
+    llm = init_chat_model(
+        settings.AGENT_MODEL,
+        model_provider="groq",
         api_key=groq_api_key,
         temperature=settings.RAG_LLM_TEMPERATURE,
+        rate_limiter=_rate_limiter,
     )
 
-    tools = build_agent_tools(user_id, groq_api_key, course_id)
+    # Summarisation model can be smaller/cheaper
+    summary_llm = init_chat_model(
+        settings.SUMMARY_MODEL,
+        model_provider="groq",
+        api_key=groq_api_key,
+        temperature=0.0,
+        rate_limiter=_rate_limiter,
+    )
 
-    agent = create_react_agent(
+    tools = build_agent_tools(user_id, groq_api_key, course_id, session_id)
+
+    agent = create_agent(
         model=llm,
         tools=tools,
-        prompt=_make_prompt,      # callable: trims history before each LLM call
+        system_prompt=AGENT_SYSTEM_PROMPT,
+        middleware=[
+            SummarizationMiddleware(
+                model=summary_llm,
+                keep=("messages", MAX_HISTORY_MESSAGES),
+            ),
+            ModelRetryMiddleware(
+                max_retries=3,
+                retry_on=(Exception,),
+                backoff_factor=2.0,
+                initial_delay=1.0,
+            ),
+            ModelCallLimitMiddleware(run_limit=25),
+        ],
         checkpointer=_get_checkpointer(),
     )
 
@@ -148,8 +171,6 @@ def build_tutor_agent(
 
 
 # ── Invoke (full response) ───────────────────────────────────────
-
-MAX_RETRIES = 3
 
 async def invoke_agent(
     agent,
@@ -159,8 +180,8 @@ async def invoke_agent(
     """
     Invoke the tutor agent and return the complete response.
 
-    Retries up to MAX_RETRIES times on Groq tool_use_failed errors
-    (intermittent 400s when model generates malformed tool calls).
+    Retries are handled automatically by ModelRetryMiddleware,
+    so this function is a thin async wrapper around ``agent.invoke``.
 
     Returns:
         {"answer": str, "messages": list}
@@ -168,25 +189,14 @@ async def invoke_agent(
     config = {"configurable": {"thread_id": session_id}}
     inputs = {"messages": [HumanMessage(content=query)]}
 
-    last_error = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            result = await asyncio.to_thread(agent.invoke, inputs, config)
-            messages = result.get("messages", [])
-            answer = _extract_final_answer(messages)
-            return {"answer": answer, "messages": messages}
-        except Exception as e:
-            last_error = e
-            error_str = str(e)
-            if "tool_use_failed" in error_str or "failed_generation" in error_str:
-                logger.warning(
-                    f"Groq tool_use_failed (attempt {attempt + 1}/{MAX_RETRIES}), retrying..."
-                )
-                await asyncio.sleep(1 * (attempt + 1))
-                continue
-            raise
-
-    raise last_error
+    try:
+        result = await asyncio.to_thread(agent.invoke, inputs, config)
+        messages = result.get("messages", [])
+        answer = _extract_final_answer(messages)
+        return {"answer": answer, "messages": messages}
+    except Exception as e:
+        logger.error(f"Agent invocation failed: {e}", exc_info=True)
+        raise
 
 
 # ── Stream (Server-Sent Events) ──────────────────────────────────

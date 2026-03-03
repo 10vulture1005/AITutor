@@ -3,7 +3,7 @@ Session utilities for the Eduverse AI tutor.
 
 The agent stores conversation state in PostgresSaver checkpoint tables.
 This module provides helper functions to list and clear sessions,
-using PostgresSaver's API for proper deserialization of message data.
+using PostgresSaver's built-in API wherever possible.
 """
 
 import logging
@@ -11,7 +11,6 @@ from typing import List
 
 from sqlalchemy import text
 
-from app.core.config import settings
 from app.core.sync_db import get_sync_engine
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,9 @@ def list_user_sessions(user_id: str) -> List[str]:
 
     Queries the checkpoints table where thread_id
     starts with the user's ID prefix (format: {user_id}_{uuid}).
+
+    Note: PostgresSaver.list() only supports exact thread_id match,
+    not prefix (LIKE) filtering, so raw SQL is correct here.
     """
     try:
         engine = get_sync_engine()
@@ -49,30 +51,18 @@ def list_user_sessions(user_id: str) -> List[str]:
 
 def clear_session(session_id: str) -> bool:
     """
-    Clear a session's checkpoint data.
+    Clear a session's checkpoint data using PostgresSaver.delete_thread().
 
-    Returns True if any rows were deleted.
+    This is the built-in API that performs the same 3-table DELETE
+    (checkpoints, checkpoint_blobs, checkpoint_writes) in a single call.
+
+    Returns True if the operation succeeded (thread existed or not).
     """
     try:
-        engine = get_sync_engine()
-        with engine.begin() as conn:
-            r1 = conn.execute(
-                text("DELETE FROM checkpoint_writes WHERE thread_id = :tid"),
-                {"tid": session_id},
-            )
-            r2 = conn.execute(
-                text("DELETE FROM checkpoint_blobs WHERE thread_id = :tid"),
-                {"tid": session_id},
-            )
-            r3 = conn.execute(
-                text("DELETE FROM checkpoints WHERE thread_id = :tid"),
-                {"tid": session_id},
-            )
-            deleted = (r1.rowcount or 0) + (r2.rowcount or 0) + (r3.rowcount or 0)
-
-        if deleted:
-            logger.info(f"Cleared session: {session_id} ({deleted} rows)")
-        return deleted > 0
+        checkpointer = _get_checkpointer()
+        checkpointer.delete_thread(session_id)
+        logger.info(f"Cleared session via delete_thread: {session_id}")
+        return True
     except Exception as e:
         logger.warning(f"Could not clear session {session_id}: {e}")
         return False

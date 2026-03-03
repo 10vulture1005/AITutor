@@ -4,7 +4,10 @@ from typing import Optional
 
 from langchain_groq import ChatGroq
 from langchain_core.documents import Document
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +20,39 @@ VISION_PROMPT = (
     "slides (capture text and visual elements). Be thorough and educational."
 )
 
+
+def create_vision_llm(groq_api_key: str, model: str = None) -> ChatGroq:
+    """Create a reusable ChatGroq vision instance.
+
+    Call once and pass to ``analyze_image`` via the *llm* parameter to
+    avoid creating a new client for every frame / image.
+    """
+    return ChatGroq(
+        model=model or settings.VISION_MODEL,
+        api_key=groq_api_key,
+        max_tokens=1024,
+        temperature=0.2,
+    )
+
+
 async def analyze_image(
     image_bytes: bytes,
     groq_api_key: str,
     prompt: str = VISION_PROMPT,
-    model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
+    model: str = None,
+    llm: Optional[BaseChatModel] = None,
 ) -> str:
-    """Analyze image using ChatGroq vision via LangChain messages API."""
+    """Analyze image using ChatGroq vision via LangChain messages API.
+
+    Parameters
+    ----------
+    llm : optional
+        Pre-created vision LLM.  When processing many images (e.g.
+        video frames) pass a shared instance created by
+        ``create_vision_llm`` to avoid per-call overhead.
+    """
     try:
-        llm = ChatGroq(model=model, api_key=groq_api_key, max_tokens=1024, temperature=0.2)
+        _llm = llm or create_vision_llm(groq_api_key, model)
         b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         msg = HumanMessage(content=[
@@ -33,7 +60,7 @@ async def analyze_image(
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ])
 
-        response = await llm.ainvoke([msg])
+        response = await _llm.ainvoke([msg])
         return response.content.strip()
 
     except Exception as e:

@@ -1,12 +1,28 @@
 """
-Semantic chunking with contextual prefixes and parent-child storage.
+Contextual chunking with late context expansion.
 
-Improvements over basic chunking:
-1. Context prefix: Each chunk starts with "[From file.pdf, page 2]"
-   so the embedding captures WHERE the content comes from.
-2. Parent-child: Small chunks (300 chars) for precise retrieval,
-   full parent content (800 chars) stored in metadata for richer LLM context.
-3. Document type: Auto-detected from filename (lab/assignment/exam/lecture).
+This implements the Anthropic "Contextual Retrieval" pattern and adds
+neighbouring-chunk context for better grounding:
+
+1. **Contextual prefix** — each chunk is prepended with a sentence
+   describing WHERE it comes from (file, page, section) so the
+   embedding captures provenance.  Computed at *index time*, so
+   query-time latency is unchanged.
+
+2. **Parent content** — the full source page / segment (up to
+   ``RAG_PARENT_CHUNK_SIZE`` chars) is stored in metadata.  At answer
+   time the agent sees the wider context, not just a 300-char sliver.
+
+3. **Neighbour context** — for multi-chunk documents the *previous*
+   and *next* chunk texts are stored in metadata (``context_before``,
+   ``context_after``).  The retriever concatenates them at read time
+   to give the LLM a 3-chunk sliding window without duplicating
+   embeddings.
+
+4. **Document type detection** — auto-classified from filename
+   (lab / assignment / exam / lecture) so agents can weight sources.
+
+All enrichment runs during *indexing*.  Zero extra latency at query time.
 """
 
 import logging
@@ -16,17 +32,32 @@ from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from app.core.config import settings
+from app.processing.text_cleaner import clean_text
+
 logger = logging.getLogger(__name__)
 
 
 class SemanticMerger:
     """Chunks and normalizes documents with contextual enrichment."""
 
-    def __init__(self, chunk_size: int = 300, chunk_overlap: int = 50):
+    def __init__(
+        self,
+        chunk_size: int = None,
+        chunk_overlap: int = None,
+    ):
+        self.chunk_size = chunk_size or settings.RAG_CHUNK_SIZE
+        self.chunk_overlap = chunk_overlap or settings.RAG_CHUNK_OVERLAP
+        self.parent_size = settings.RAG_PARENT_CHUNK_SIZE
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            # Markdown headings first → structure-aware splitting for PDFs
+            # that produce markdown output (tables, headings, etc.)
+            separators=[
+                "\n# ", "\n## ", "\n### ", "\n#### ",
+                "\n\n", "\n", ". ", " ", "",
+            ],
         )
 
     def merge_and_chunk(
@@ -39,45 +70,84 @@ class SemanticMerger:
         Split documents into contextually-enriched chunks.
 
         Each chunk gets:
-          - A context prefix (file name, page number)
+          - A contextual prefix (file name, page, document type)
           - Parent content in metadata (for richer LLM answers)
+          - Neighbouring chunk text in metadata (3-chunk sliding window)
           - Normalized metadata with document_type
         """
         if not documents:
             return []
 
-        all_chunks = []
+        all_chunks: list[Document] = []
+
         for doc in documents:
-            # Build context prefix from metadata
+            # Clean PDF text (fix hyphenation, remove artifacts, normalize
+            # whitespace) — transcription content is already cleaned by the
+            # audio/video processors.
+            raw_text = doc.page_content
+            if doc.metadata.get("source_type") == "pdf":
+                raw_text = clean_text(raw_text)
+
             prefix = self._build_prefix(doc.metadata)
+            parent_content = raw_text[: self.parent_size]
 
-            # Store original content as parent (truncated to 800 chars)
-            parent_content = doc.page_content[:800]
+            # Split into child chunks
+            children = self.splitter.split_text(raw_text)
 
-            # Split into small child chunks
-            children = self.splitter.split_text(doc.page_content)
-
+            # Build all chunks for this document first (for neighbour context)
+            doc_chunks: list[Document] = []
+            raw_children: list[str] = []  # without prefix, for neighbour context
             for child_text in children:
-                # Prepend context prefix to chunk content
                 enriched_content = f"{prefix}{child_text}"
 
-                # Build normalized metadata with parent content
                 meta = self._normalize(doc.metadata, course_id, course_name)
                 meta["parent_content"] = parent_content
 
-                all_chunks.append(Document(
+                doc_chunks.append(Document(
                     page_content=enriched_content,
                     metadata=meta,
                 ))
+                raw_children.append(child_text)
 
-        logger.info(f"Merged {len(documents)} docs → {len(all_chunks)} chunks (contextual)")
+            # ── Neighbour context (3-chunk sliding window) ────────
+            # Store previous / next chunk *raw* text (without the
+            # contextual prefix) so the retriever can expand context
+            # at read time without duplicating the [From ...] prefix
+            # three times in the final expanded content.
+            for i, chunk in enumerate(doc_chunks):
+                chunk.metadata["context_before"] = (
+                    raw_children[i - 1] if i > 0 else ""
+                )
+                chunk.metadata["context_after"] = (
+                    raw_children[i + 1]
+                    if i < len(raw_children) - 1
+                    else ""
+                )
+
+            all_chunks.extend(doc_chunks)
+
+        logger.info(
+            f"Merged {len(documents)} docs → {len(all_chunks)} chunks "
+            f"(contextual + neighbour window)"
+        )
         return all_chunks
 
     def _build_prefix(self, meta: dict) -> str:
-        """Build a context prefix like '[From LAB 1.pdf, page 2] '."""
+        """Build a contextual prefix like '[From LAB 1.pdf, page 2, lecture] '.
+
+        The prefix is embedded together with the chunk so the vector
+        captures WHERE the content comes from — critical for ambiguous
+        queries that match multiple pages.
+        """
         parts = [meta.get("file_name", "unknown")]
         if page := meta.get("page_number"):
             parts.append(f"page {page}")
+        if start := meta.get("start_time"):
+            end = meta.get("end_time", "")
+            parts.append(f"{start}s–{end}s")
+        doc_type = self._detect_doc_type(meta.get("file_name", ""))
+        if doc_type != "document":
+            parts.append(doc_type)
         return f"[From {', '.join(parts)}] "
 
     def _normalize(

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
 from app.core.database import get_db
+from app.core.utils import validate_groq_key
 from app.models.database import User
 from app.rag.agent import build_tutor_agent, invoke_agent, stream_agent
 from app.rag.tools import get_citations
@@ -106,11 +107,10 @@ async def chat_query(
       - `course_id`: Restrict retrieval to one course's materials.
     """
     # ── Validate inputs ──────────────────────────────────────────
-    if not x_groq_api_key or not x_groq_api_key.startswith("gsk_"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Groq API key. Must start with 'gsk_'.",
-        )
+    try:
+        validate_groq_key(x_groq_api_key)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     if not request.question.strip():
         raise HTTPException(
@@ -127,6 +127,7 @@ async def chat_query(
             user_id=user.id,
             groq_api_key=x_groq_api_key,
             course_id=request.course_id,
+            session_id=session_id,
         )
 
         result = await invoke_agent(
@@ -138,7 +139,7 @@ async def chat_query(
         answer = result.get("answer", "I could not generate a response.")
 
         # ── Get citations from tool cache (structured JSON) ──
-        sources = get_citations(user.id)
+        sources = get_citations(session_id)
         citations = [
             CitationResponse(
                 number=s["id"],
@@ -193,10 +194,15 @@ async def chat_query_stream(
 
     Use this for a real-time, responsive chat experience.
     """
-    if not x_groq_api_key or not x_groq_api_key.startswith("gsk_"):
+    try:
+        validate_groq_key(x_groq_api_key)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not request.question.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Groq API key.",
+            detail="Question cannot be empty.",
         )
 
     session_id = request.session_id or f"{user.id}_{uuid.uuid4().hex[:12]}"
@@ -205,6 +211,7 @@ async def chat_query_stream(
         user_id=user.id,
         groq_api_key=x_groq_api_key,
         course_id=request.course_id,
+        session_id=session_id,
     )
 
     return StreamingResponse(
