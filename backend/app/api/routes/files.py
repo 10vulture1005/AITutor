@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
@@ -57,7 +58,15 @@ async def process_file(
 
     try:
         if ftype == 'pdf':
-            docs = await process_pdf(content, x_groq_api_key, fname, course_id)
+            # process_pdf expects a file path, not bytes —
+            # save to a temp file, process, then clean up.
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                docs = await process_pdf(tmp_path, x_groq_api_key, fname, course_id)
+            finally:
+                os.unlink(tmp_path)
         elif ftype == 'image':
             docs = [await process_image(content, x_groq_api_key, fname, course_id)]
         elif ftype == 'audio':
@@ -85,7 +94,7 @@ async def process_file(
 
 
 @router.get("/supported-formats")
-async def get_supported_formats():
+async def get_supported_formats(_user=Depends(get_current_user)):
     return {
         "pdf": [".pdf"],
         "image": sorted(SUPPORTED_IMAGE_FORMATS),
