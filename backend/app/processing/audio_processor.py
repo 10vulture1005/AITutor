@@ -4,9 +4,9 @@ import os
 import tempfile
 from typing import List, Optional
 
-from groq import Groq
 from langchain_core.documents import Document
 
+from app.core.utils import create_groq_client
 from app.processing.text_cleaner import clean_transcription
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ SEGMENT_DURATION = 30
 
 def _transcribe_sync(audio_path: str, groq_api_key: str) -> dict:
     """Synchronous Whisper transcription — called via asyncio.to_thread()."""
-    client = Groq(api_key=groq_api_key)
+    client = create_groq_client(groq_api_key)
 
     with open(audio_path, 'rb') as f:
         response = client.audio.transcriptions.create(

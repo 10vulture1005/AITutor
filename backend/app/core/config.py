@@ -1,7 +1,6 @@
-from typing import List, Optional, Union
-from pydantic import AnyHttpUrl, field_validator
+from typing import List, Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Eduverse Backend"
@@ -38,13 +37,23 @@ class Settings(BaseSettings):
     JSON_MODEL: str = "openai/gpt-oss-20b"
     # Web search: Groq's built-in web search
     WEB_SEARCH_MODEL: str = "groq/compound-mini"
+    # Query rewriting: fast & lightweight to avoid rate limits
+    QUERY_REWRITE_MODEL: str = "llama-3.1-8b-instant"
+    # Summarization: separate model to spread TPM load
+    SUMMARY_MODEL: str = "llama-3.3-70b-versatile"
+    # Vision analysis (PDF images, video frames)
+    VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     # RAG settings
     RAG_LLM_TEMPERATURE: float = 0.3
-    RAG_RETRIEVER_K: int = 5
-    RAG_RETRIEVER_FETCH_K: int = 30
+    RAG_RETRIEVER_K: int = 8
+    RAG_RETRIEVER_FETCH_K: int = 50
     RAG_RERANK_TOP_N: int = 5
-    RAG_RELEVANCE_THRESHOLD: float = 0.45  
+    RAG_RERANK_MODEL: str = "ms-marco-MiniLM-L-12-v2"
+    RAG_RERANK_SCORE_THRESHOLD: float = 0.0
+    RAG_CHUNK_SIZE: int = 800
+    RAG_CHUNK_OVERLAP: int = 200
+    RAG_PARENT_CHUNK_SIZE: int = 1600
 
     GROQ_API_KEY: Optional[str] = None
 

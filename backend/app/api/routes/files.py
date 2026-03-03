@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 
 from app.api.routes.auth import get_current_user
-
+from app.core.utils import validate_groq_key
 from app.processing.audio_processor import process_audio_bytes, SUPPORTED_AUDIO_FORMATS
 from app.processing.image_processor import process_image, SUPPORTED_IMAGE_FORMATS
 from app.processing.pdf_processor import process_pdf
@@ -38,8 +38,10 @@ async def process_file(
     Upload any file (PDF/image/audio/video) → auto-detect → process → chunked documents.
     Requires Groq API key in X-Groq-Api-Key header.
     """
-    if not x_groq_api_key or not x_groq_api_key.startswith("gsk_"):
-        raise HTTPException(status_code=400, detail="Invalid Groq API key. Must start with 'gsk_'.")
+    try:
+        validate_groq_key(x_groq_api_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     ftype = _file_type(file.filename or "unknown")
     if ftype == 'unknown':

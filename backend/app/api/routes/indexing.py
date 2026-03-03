@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -157,16 +158,28 @@ async def start_course_indexing(
     # Commit all status changes in one transaction BEFORE scheduling background tasks
     await db.commit()
 
-    # Now schedule the background tasks (db is already committed)
-    for file_record in pending_files:
-        background_tasks.add_task(
-            run_indexing,
-            file_id=file_record.id,
-            user_id=user.id,
-            groq_api_key=x_groq_api_key,
-            course_id=course_id,
-            course_name=course.name,
+    # Process files concurrently (with semaphore to respect Groq rate limits)
+    # Using asyncio.gather inside a single background task instead of
+    # sequential BackgroundTasks which awaits each coroutine in order.
+    sem = asyncio.Semaphore(3)  # max 3 files at once
+
+    async def _index_with_limit(file_record):
+        async with sem:
+            return await run_indexing(
+                file_id=file_record.id,
+                user_id=user.id,
+                groq_api_key=x_groq_api_key,
+                course_id=course_id,
+                course_name=course.name,
+            )
+
+    async def _batch_index():
+        await asyncio.gather(
+            *(_index_with_limit(f) for f in pending_files),
+            return_exceptions=True,
         )
+
+    background_tasks.add_task(_batch_index)
 
     return BatchIndexingResponse(
         message=f"Queued {len(file_ids)} files for indexing",
@@ -249,4 +262,84 @@ async def delete_from_index(
         "message": f"File '{file_record.drive_name}' removed from index",
         "file_id": file_id,
         "status": "pending",
+    }
+
+
+# ── DELETE /indexing/course/{course_id} ──────────────────────────
+@router.delete("/course/{course_id}")
+async def delete_course_from_index(
+    course_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Remove **all** indexed files for a course from the vector store
+    and reset their status to ``pending``.
+
+    This allows the entire course to be re-indexed.
+    """
+    # Verify course belongs to user
+    course_result = await db.execute(
+        select(Course).where(Course.id == course_id, Course.user_id == user.id)
+    )
+    course = course_result.scalar_one_or_none()
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Course {course_id} not found",
+        )
+
+    # Get all indexed files for this course
+    files_result = await db.execute(
+        select(File).where(
+            File.course_id == course_id,
+            File.user_id == user.id,
+            File.processing_status == "completed",
+        )
+    )
+    indexed_files = files_result.scalars().all()
+
+    if not indexed_files:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No indexed files found for this course",
+        )
+
+    # Remove each file's chunks from the vector store
+    vector_store = EduverseVectorStore(user_id=user.id)
+    deleted_ids = []
+    failed_ids = []
+
+    for file_record in indexed_files:
+        try:
+            vector_store.delete_by_file(file_id=file_record.id)
+        except Exception as e:
+            logger.warning(
+                f"Vector store deletion failed for file {file_record.id}: {e}"
+            )
+            failed_ids.append(file_record.id)
+            continue
+
+        # Reset file status
+        file_record.processing_status = "pending"
+        file_record.processing_error = None
+        file_record.chunk_count = 0
+        file_record.contains_visual = False
+        file_record.detected_type = None
+        file_record.processed_at = None
+        deleted_ids.append(file_record.id)
+
+    await db.flush()
+
+    # Invalidate retriever cache so stale data isn't served
+    from app.rag.retriever import invalidate_retriever_cache
+    invalidate_retriever_cache(user.id, course_id)
+
+    return {
+        "message": f"Removed {len(deleted_ids)} files from index for course '{course.name}'",
+        "course_id": course_id,
+        "deleted_count": len(deleted_ids),
+        "deleted_file_ids": deleted_ids,
+        "failed_count": len(failed_ids),
+        "failed_file_ids": failed_ids,
     }

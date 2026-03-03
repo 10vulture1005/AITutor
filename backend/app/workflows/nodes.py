@@ -9,7 +9,7 @@ Each node is an async function that:
 Nodes:
   download_node  → Downloads file from Google Drive to local storage
   process_node   → Routes to the correct processor (PDF/video/audio/image)
-  chunk_node     → Splits documents into 500-char chunks via SemanticMerger
+  chunk_node     → Splits documents into contextual chunks via SemanticMerger
   embed_node     → Embeds chunks into the user's pgvector collection
   update_db_node → Updates the File record in the database with results
 """
@@ -158,10 +158,8 @@ async def process_node(state: IndexingState) -> Dict[str, Any]:
 
     try:
         if file_type == "pdf":
-            with open(file_path, "rb") as f:
-                content = f.read()
             documents = await process_pdf(
-                file_content=content,
+                file_path=file_path,
                 groq_api_key=groq_api_key,
                 file_name=file_name,
                 course_id=course_id,
@@ -233,10 +231,10 @@ async def process_node(state: IndexingState) -> Dict[str, Any]:
 
 # ── Node 3: Chunk ───────────────────────────────────────────────
 async def chunk_node(state: IndexingState) -> Dict[str, Any]:
-    """
-    Split documents into 500-char chunks using SemanticMerger.
+    """Split documents into contextually-enriched chunks using SemanticMerger.
 
-    Uses LangChain's RecursiveCharacterTextSplitter under the hood,
+    Chunk sizes are configurable via settings (RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP).
+    Uses LangChain RecursiveCharacterTextSplitter under the hood
     and normalizes metadata to the fixed vector schema.
     """
     documents = state.get("documents", [])
@@ -246,7 +244,7 @@ async def chunk_node(state: IndexingState) -> Dict[str, Any]:
     course_id = state.get("course_id")
     course_name = state.get("course_name")
 
-    merger = SemanticMerger()  # uses default 300/50 (optimized for precision)
+    merger = SemanticMerger()  # uses settings.RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP
     chunks = merger.merge_and_chunk(
         documents=documents,
         course_id=course_id,

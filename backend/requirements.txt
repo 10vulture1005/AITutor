@@ -11,22 +11,20 @@ google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.116.0
 
 # LangChain ecosystem
-langchain>=0.2.0
-langchain-classic>=1.0.1
-langchain-groq>=0.1.0
-langchain-community>=0.0.20
-langchain-postgres>=0.0.9
-langchain-huggingface>=0.0.1
-langchain-text-splitters>=0.0.1
+langchain>=1.2.0
+langchain-groq>=1.1.0
+langchain-community>=0.4.0
+langchain-postgres>=0.0.17
+langchain-huggingface>=1.2.0
+langchain-text-splitters>=1.1.0
 
 # LangGraph (workflow orchestration)
-langgraph>=0.2.0
-langgraph-checkpoint>=2.0.0
-langgraph-checkpoint-postgres>=2.0.0
+langgraph>=1.0.0
+langgraph-checkpoint>=4.0.0
+langgraph-checkpoint-postgres>=3.0.0
 
 # Local embeddings (FREE)
 sentence-transformers>=2.3.0
-rank_bm25
 
 # Local reranking (FREE)
 flashrank>=0.2.0
@@ -36,6 +34,7 @@ groq>=0.4.0
 
 # Document processing
 pymupdf>=1.23.0
+langchain-pymupdf4llm>=0.5.0
 ffmpeg-python>=0.2.0
 Pillow>=10.0.0
 

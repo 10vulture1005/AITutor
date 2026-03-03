@@ -38,8 +38,9 @@ async def login(request: Request, redirect: bool = True):
     - If redirect=true (default): Redirects browser to Google login page
     - If redirect=false: Returns the OAuth URL as JSON (for Swagger/API testing)
     """
-    auth_url, state = auth_service.get_authorization_url()
+    auth_url, state, code_verifier = auth_service.get_authorization_url()
     request.session["oauth_state"] = state
+    request.session["oauth_code_verifier"] = code_verifier
     
     if redirect:
         return RedirectResponse(auth_url)
@@ -67,7 +68,8 @@ async def callback(
         )
     
     try:
-        token_info = await auth_service.exchange_code_for_tokens(code)
+        code_verifier = request.session.get("oauth_code_verifier")
+        token_info = await auth_service.exchange_code_for_tokens(code, code_verifier)
         
         google_user_info = await auth_service.get_user_info(token_info)
         
