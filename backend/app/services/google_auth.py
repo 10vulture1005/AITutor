@@ -46,12 +46,12 @@ class GoogleAuthService:
             }
         }
 
-    def get_authorization_url(self) -> tuple[str, str]:
+    def get_authorization_url(self) -> tuple[str, str, str]:
         """
         Get Google OAuth authorization URL.
         
         Returns:
-            (authorization_url, state)
+            (authorization_url, state, code_verifier)
         """
         flow = Flow.from_client_config(
             self.client_config,
@@ -210,6 +210,9 @@ class GoogleAuthService:
         
         if not user:
             raise ResourceNotFoundError(f"User {user_id} not found")
+        
+        if not user.encrypted_access_token:
+            raise GoogleAuthError("User has no stored access token — please re-login")
         
         access_token = decrypt_token(user.encrypted_access_token)
         refresh_token = decrypt_token(user.encrypted_refresh_token) if user.encrypted_refresh_token else None

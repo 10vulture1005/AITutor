@@ -35,12 +35,9 @@ groq>=0.4.0
 # Document processing
 pymupdf>=1.23.0
 langchain-pymupdf4llm>=0.5.0
-ffmpeg-python>=0.2.0
-Pillow>=10.0.0
 
 # Database (PostgreSQL via Supabase)
 sqlalchemy>=2.0.0
-alembic>=1.13.0
 asyncpg>=0.29.0
 psycopg[binary]>=3.1.0
 psycopg-pool>=3.1.0
@@ -48,12 +45,8 @@ psycopg-pool>=3.1.0
 # Auth & Security
 python-jose[cryptography]>=3.3.0
 bcrypt>=4.1.0
-httpx>=0.26.0
 itsdangerous>=2.2.0
 cryptography>=42.0.0
 
 # Retry logic
 backoff>=2.2.0
-
-# Utils
-python-dotenv>=1.0.0

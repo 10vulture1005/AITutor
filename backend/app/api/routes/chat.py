@@ -9,6 +9,7 @@ Provides five endpoints:
   DELETE /chat/session/{session}  → Clear a session's memory
 """
 
+import asyncio
 import logging
 import uuid
 from typing import List, Optional
@@ -22,7 +23,7 @@ from app.api.routes.auth import get_current_user
 from app.core.database import get_db
 from app.core.utils import validate_groq_key
 from app.models.database import User
-from app.rag.agent import build_tutor_agent, invoke_agent, stream_agent
+from app.rag.agent import build_tutor_agent, invoke_agent, stream_agent, _get_checkpointer
 from app.rag.tools import get_citations
 from app.rag.memory import clear_session, get_session_messages, list_user_sessions
 
@@ -122,12 +123,16 @@ async def chat_query(
     session_id = request.session_id or f"{user.id}_{uuid.uuid4().hex[:12]}"
 
     try:
+        # ── Build checkpointer off-thread to avoid blocking event loop ─
+        checkpointer = await asyncio.to_thread(_get_checkpointer)
+
         # ── Build and invoke the tutor agent ──────────────────────
         agent = build_tutor_agent(
             user_id=user.id,
             groq_api_key=x_groq_api_key,
             course_id=request.course_id,
             session_id=session_id,
+            checkpointer=checkpointer,
         )
 
         result = await invoke_agent(
@@ -207,11 +212,14 @@ async def chat_query_stream(
 
     session_id = request.session_id or f"{user.id}_{uuid.uuid4().hex[:12]}"
 
+    checkpointer = await asyncio.to_thread(_get_checkpointer)
+
     agent = build_tutor_agent(
         user_id=user.id,
         groq_api_key=x_groq_api_key,
         course_id=request.course_id,
         session_id=session_id,
+        checkpointer=checkpointer,
     )
 
     return StreamingResponse(
@@ -232,7 +240,7 @@ async def chat_query_stream(
 @router.get("/sessions")
 async def list_sessions(user: User = Depends(get_current_user)):
     """List all chat sessions for the current user."""
-    sessions = list_user_sessions(user.id)
+    sessions = await asyncio.to_thread(list_user_sessions, user.id)
     return {"sessions": sessions, "count": len(sessions)}
 
 
@@ -253,7 +261,7 @@ async def chat_history(
             detail="You can only access your own sessions.",
         )
 
-    messages = get_session_messages(session_id)
+    messages = await asyncio.to_thread(get_session_messages, session_id)
 
     return HistoryResponse(
         session_id=session_id,
@@ -278,7 +286,7 @@ async def delete_session(
             detail="You can only delete your own sessions.",
         )
 
-    cleared = clear_session(session_id)
+    cleared = await asyncio.to_thread(clear_session, session_id)
 
     if not cleared:
         raise HTTPException(

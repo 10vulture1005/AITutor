@@ -77,10 +77,11 @@ async def start_indexing(
             detail="File already indexed. Delete first to re-index.",
         )
 
-    # Mark as processing
+    # Mark as processing — commit (not flush!) to release the row lock
+    # before the background task tries to UPDATE the same row with its own session.
     file_record.processing_status = "processing"
     file_record.processing_error = None
-    await db.flush()
+    await db.commit()
 
     # Get course name for metadata
     course_name = None

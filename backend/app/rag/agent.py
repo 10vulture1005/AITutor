@@ -116,6 +116,7 @@ def build_tutor_agent(
     groq_api_key: str,
     course_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    checkpointer: Optional[PostgresSaver] = None,
 ):
     """
     Build the LangGraph tutor agent using ``create_agent``.
@@ -164,7 +165,7 @@ def build_tutor_agent(
             ),
             ModelCallLimitMiddleware(run_limit=25),
         ],
-        checkpointer=_get_checkpointer(),
+        checkpointer=checkpointer,
     )
 
     return agent
